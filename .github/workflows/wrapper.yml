@@ -52,22 +52,22 @@ jobs:
               uses: astral-sh/setup-uv@v5
 
             - name: Setup Rust
-              if: false
+              if: true
               uses: dtolnay/rust-toolchain@stable
 
             - name: Rust Cache
-              if: false
+              if: true
               uses: swatinem/rust-cache@v2
               with:
                   workspaces: tools_rust/wrapper
 
             - name: Compile
-              if: false
+              if: true
               working-directory: tools_rust/wrapper
               run: cargo build --release
 
             - name: Where am I?
-              if: false
+              if: true
               run: |
                   tools_rust/wrapper/target/release/mcp_stdio_wrapper --help
 
@@ -77,7 +77,9 @@ jobs:
                   if [ -f "./.persistent_secret" ]; then
                     echo "DYNAMIC_JWT_SECRET=$(cat .persistent_secret)" >> $GITHUB_ENV
                   else
-                    SECRET=$(openssl rand -base64 32)
+                    # SECRET=$(openssl rand -base64 32)
+                    # debug m*-t***-k**
+                    SECRET="my-test-key"
                     echo "DYNAMIC_JWT_SECRET=$SECRET" >> $GITHUB_ENV
                     echo "$SECRET" > .persistent_secret
                   fi
@@ -87,7 +89,10 @@ jobs:
                   GUNICORN_WORKERS: 1
                   MCPGATEWAY_UI_ENABLED: true
                   MCPGATEWAY_ADMIN_API_ENABLED: true
+                  SSRF_PROTECTION_ENABLED: false
                   JWT_SECRET_KEY: ${{ env.DYNAMIC_JWT_SECRET }}
+                  ADMIN_REQUIRE_PASSWORD_CHANGE_ON_BOOTSTRAP: false
+                  PASSWORD_CHANGE_ENFORCEMENT_ENABLED: false
 
               run: |
 
@@ -120,9 +125,217 @@ jobs:
                   -H "Authorization: Bearer ${{ steps.generate_jwt.outputs.token }}" \
                   -H "Content-Type: application/json"
 
+            - name: Setup Go
+              uses: actions/setup-go@v5
+              with:
+                  go-version: "1.21"
+                  cache-dependency-path: mcp-servers/go/fast-time-server/go.sum
+
+            - name: Build fast-time-server
+              working-directory: mcp-servers/go/fast-time-server
+              run: |
+                  go build -o fast-time-server .
+                  chmod +x fast-time-server
+
+            - name: Register Fast Time Gateway and Create Tools
+              run: |
+                  TOKEN="${{ steps.generate_jwt.outputs.token }}"
+
+                  # Kill any existing fast-time-server processes (container reuse cleanup)
+                  echo "Cleaning up any existing fast-time-server processes..."
+                  pkill -9 -f "fast-time-server" 2>/dev/null || true
+                  sleep 1
+
+                  # Start fast-time-server in background (compiled binary)
+                  echo "Starting fast-time-server..."
+                  mcp-servers/go/fast-time-server/fast-time-server \
+                    -transport=dual -listen=0.0.0.0 -port=8889 -log-level=info &
+                  FAST_TIME_PID=$!
+
+                  # Wait for fast-time-server to be ready
+                  echo "Waiting for fast-time-server..."
+                  for i in {1..30}; do
+                    if curl -s http://localhost:8889/health >/dev/null 2>&1; then
+                      echo "fast-time-server is up!"
+                      break
+                    fi
+                    echo "Waiting for fast-time-server... (attempt $i)"
+                    sleep 2
+                  done
+
+                  # Register gateway
+                  echo "Registering fast_time gateway..."
+                  GATEWAY_RESPONSE=$(curl -s -X POST http://localhost:4444/gateways \
+                    -H "Authorization: Bearer $TOKEN" \
+                    -H "Content-Type: application/json" \
+                    -d '{
+                      "name": "fast_time",
+                      "url": "http://localhost:8889/http",
+                      "transport": "STREAMABLEHTTP"
+                    }')
+                  echo "Gateway response: $GATEWAY_RESPONSE"
+
+                  # Extract gateway ID (handle existing gateway)
+                  if echo "$GATEWAY_RESPONSE" | grep -q "already exists"; then
+                    echo "Gateway already exists, fetching existing ID..."
+                    GATEWAYS=$(curl -s http://localhost:4444/gateways \
+                      -H "Authorization: Bearer $TOKEN")
+                    GATEWAY_ID=$(echo "$GATEWAYS" | jq -r '.[] | select(.name=="fast_time") | .id')
+                  else
+                    GATEWAY_ID=$(echo "$GATEWAY_RESPONSE" | jq -r '.id')
+                  fi
+                  echo "Gateway ID: $GATEWAY_ID"
+
+                  # Wait for tools to sync
+                  echo "Waiting for tools to sync..."
+                  for i in {1..30}; do
+                    TOOLS=$(curl -s http://localhost:4444/tools \
+                      -H "Authorization: Bearer $TOKEN")
+                    TOOL_COUNT=$(echo "$TOOLS" | jq --arg gid "$GATEWAY_ID" '[.[] | select(.gatewayId==$gid)] | length')
+                    if [ "$TOOL_COUNT" -gt 0 ]; then
+                      echo "Found $TOOL_COUNT tools from fast_time gateway"
+                      echo "$TOOLS" | jq --arg gid "$GATEWAY_ID" '[.[] | select(.gatewayId==$gid) | .name]'
+                      break
+                    fi
+                    echo "Waiting for tools to sync... (attempt $i)"
+                    sleep 2
+                  done
+
+                  # Get tool IDs
+                  TOOLS=$(curl -s http://localhost:4444/tools \
+                    -H "Authorization: Bearer $TOKEN")
+                  TOOL_IDS=$(echo "$TOOLS" | jq --arg gid "$GATEWAY_ID" -c '[.[] | select(.gatewayId==$gid) | .id]')
+                  echo "Tool IDs: $TOOL_IDS"
+
+                  # Create virtual server
+                  echo "Creating virtual server..."
+                  SERVER_RESPONSE=$(curl -s -X POST http://localhost:4444/servers \
+                    -H "Authorization: Bearer $TOKEN" \
+                    -H "Content-Type: application/json" \
+                    -d "{
+                      \"server\": {
+                        \"id\": \"9779b6698cbd4b4995ee04a4fab38737\",
+                        \"name\": \"Fast Time Server\",
+                        \"description\": \"Virtual server exposing Fast Time MCP tools\",
+                        \"associated_tools\": $TOOL_IDS,
+                        \"associated_resources\": [],
+                        \"associated_prompts\": []
+                      }
+                    }")
+                  echo "Server response: $SERVER_RESPONSE"
+
+                  # Cleanup - use robust process termination
+                  echo "Cleaning up fast-time-server process..."
+                  if [ -n "$FAST_TIME_PID" ] && kill -0 $FAST_TIME_PID 2>/dev/null; then
+                    echo "Sending SIGTERM to PID $FAST_TIME_PID..."
+                    kill -TERM $FAST_TIME_PID 2>/dev/null || true
+                    # Wait for graceful shutdown (up to 5 seconds)
+                    for i in {1..10}; do
+                      if ! kill -0 $FAST_TIME_PID 2>/dev/null; then
+                        echo "Process $FAST_TIME_PID terminated gracefully"
+                        break
+                      fi
+                      sleep 0.5
+                    done
+                    # Force kill if still running
+                    if kill -0 $FAST_TIME_PID 2>/dev/null; then
+                      echo "Process still running, sending SIGKILL..."
+                      kill -KILL $FAST_TIME_PID 2>/dev/null || true
+                    fi
+                  fi
+                  # Additional cleanup - kill any remaining fast-time-server processes
+                  pkill -9 -f "fast-time-server" 2>/dev/null || true
+                  # Wait for port to be released
+                  sleep 1
+
+            - name: Test Wrapper with Fast Time Server
+              run: |
+                  TOKEN="${{ steps.generate_jwt.outputs.token }}"
+                  SERVER_ID="9779b6698cbd4b4995ee04a4fab38737"
+                  PORT="4444"
+                  URL="http://localhost:${PORT}/servers/${SERVER_ID}/mcp"
+                  AUTH="Bearer $TOKEN"
+
+                  # Build the Rust wrapper
+                  echo "Building Rust wrapper..."
+                  cd tools_rust/wrapper
+                  cargo build --release
+                  WRAPPER_BIN="$(pwd)/target/release/mcp_stdio_wrapper"
+                  cd ../..
+
+                  # Define MCP messages
+                  INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0"}}}'
+                  NOTIFY='{"jsonrpc":"2.0","method":"notifications/initialized"}'
+                  LIST='{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+                  CALL='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fast-time-get-system-time","arguments":{"timezone":"UTC"}}}'
+
+                  # Run wrapper and capture output
+                  echo "Running wrapper test..."
+                  OUTPUT=$(
+                    {
+                      echo "$INIT"
+                      sleep 0.2
+                      echo "$NOTIFY"
+                      sleep 0.2
+                      echo "$LIST"
+                      sleep 0.2
+                      echo "$CALL"
+                      sleep 0.2
+                    } | "$WRAPPER_BIN" --url "$URL" --auth "$AUTH" --log-level debug --log-file wrapper_test.log
+                  )
+
+                  echo "Wrapper output:"
+                  echo "$OUTPUT"
+
+                  # Save output for debugging
+                  echo "$OUTPUT" > wrapper_output.json
+
+                  # Verify the response contains valid tool call result
+                  echo "Verifying wrapper response..."
+
+                  # Check for successful initialize response
+                  if ! echo "$OUTPUT" | grep -q '"result".*"protocolVersion"'; then
+                    echo "ERROR: Initialize response missing or invalid"
+                    exit 1
+                  fi
+                  echo "✓ Initialize response valid"
+
+                  # Check for tools/list response with fast-time tool
+                  if ! echo "$OUTPUT" | grep -q 'fast-time-get-system-time'; then
+                    echo "ERROR: Tool fast-time-get-system-time not found in tools/list"
+                    exit 1
+                  fi
+                  echo "✓ Tool list contains fast-time-get-system-time"
+
+                  # Check for successful tool call (should have result with time, not error)
+                  if echo "$OUTPUT" | grep -q '"error"'; then
+                    echo "ERROR: Tool call returned error"
+                    cat wrapper_test.log
+                    exit 1
+                  fi
+
+                  # Verify tool call has a result with time data
+                  if ! echo "$OUTPUT" | grep -q '"method":"tools/call"' || ! echo "$OUTPUT" | grep -A5 '"id":3' | grep -q '"result"'; then
+                    echo "ERROR: Tool call did not return successful result"
+                    exit 1
+                  fi
+                  echo "✓ Tool call returned successful result"
+
+                  echo "All wrapper tests passed!"
+
+            # - name: Upload Wrapper Test Artifacts
+            #   if: always()
+            #   uses: actions/upload-artifact@v4
+            #   with:
+            #       name: wrapper-test-logs
+            #       path: |
+            #           wrapper_output.json
+            #           wrapper_test.log
+            #       retention-days: 7
+
             - name: Keep server running for debug
               if: always()
               run: |
-                  echo "Keeping server running for 5 minutes for debugging..."
-                  sleep 300
+                  echo "Keeping server running for debugging..."
+                  sleep 3000
                   echo "Debug period ended"
