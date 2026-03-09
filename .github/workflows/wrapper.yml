@@ -85,7 +85,7 @@ jobs:
         run: |
           make venv
           make install
-          make serve
+          make serve &
 
           echo "Waiting for gateway to start..."
           until nc -z localhost 4444; do
@@ -93,3 +93,9 @@ jobs:
             sleep 1
           done
           echo "Gateway is up!"
+
+      - name: Generate JWT Token
+        env:
+          JWT_SECRET_KEY: ${{ env.DYNAMIC_JWT_SECRET }}
+        run: |
+          uv run python -m mcpgateway.utils.create_jwt_token --username admin@example.com --exp 10080 --secret "$JWT_SECRET_KEY"
