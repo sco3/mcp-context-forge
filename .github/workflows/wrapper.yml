@@ -76,13 +76,16 @@ jobs:
           # Generate secrets dynamically
           echo "DYNAMIC_JWT_SECRET=$(openssl rand -base64 32)" >> $GITHUB_ENV
 
+
       - name: Run gateway
         env:
           GUNICORN_WORKERS: 1
           MCPGATEWAY_UI_ENABLED: true
           MCPGATEWAY_ADMIN_API_ENABLED: true
           JWT_SECRET_KEY: ${{ env.DYNAMIC_JWT_SECRET }}
+          
         run: |
+
           make venv
           make install
           make serve &
