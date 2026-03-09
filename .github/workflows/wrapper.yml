@@ -105,3 +105,10 @@ jobs:
           TOKEN=$(uv run --no-dev python -m mcpgateway.utils.create_jwt_token --username admin@example.com --exp 10080 --secret "$JWT_SECRET_KEY")
           echo "token=$TOKEN" >> $GITHUB_OUTPUT
           echo "JWT Token generated successfully"
+
+      - name: Keep server running for debug
+        if: always()
+        run: |
+          echo "Keeping server running for 5 minutes for debugging..."
+          sleep 300
+          echo "Debug period ended"
