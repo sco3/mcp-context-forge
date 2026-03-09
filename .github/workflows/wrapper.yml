@@ -68,15 +68,8 @@ jobs:
 
             - name: Secrets
               run: |
-                  # Check if a local .persistent_secret file exists (mounted from host)
-                  if [ -f "./.persistent_secret" ]; then
-                    echo "DYNAMIC_JWT_SECRET=$(cat .persistent_secret)" >> $GITHUB_ENV
-                  else
-                    # debug m*-****-***
-                    SECRET=$(openssl rand -base64 32)
-                    echo "DYNAMIC_JWT_SECRET=$SECRET" >> $GITHUB_ENV
-                    echo "$SECRET" > .persistent_secret
-                  fi
+                  SECRET=$(openssl rand -base64 32)
+                  echo "DYNAMIC_JWT_SECRET=$SECRET" >> $GITHUB_ENV
 
             - name: Run gateway
               env:
