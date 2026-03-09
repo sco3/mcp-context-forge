@@ -66,20 +66,14 @@ jobs:
               working-directory: tools_rust/wrapper
               run: cargo build --release
 
-            - name: Where am I?
-              if: true
-              run: |
-                  tools_rust/wrapper/target/release/mcp_stdio_wrapper --help
-
             - name: Secrets
               run: |
                   # Check if a local .persistent_secret file exists (mounted from host)
                   if [ -f "./.persistent_secret" ]; then
                     echo "DYNAMIC_JWT_SECRET=$(cat .persistent_secret)" >> $GITHUB_ENV
                   else
-                    # SECRET=$(openssl rand -base64 32)
-                    # debug m*-t***-k**
-                    SECRET="my-test-key"
+                    # debug m*-****-***
+                    SECRET=$(openssl rand -base64 32)
                     echo "DYNAMIC_JWT_SECRET=$SECRET" >> $GITHUB_ENV
                     echo "$SECRET" > .persistent_secret
                   fi
@@ -98,6 +92,7 @@ jobs:
 
                   make venv
                   make install
+                  make stop-serve
                   make serve &
 
                   echo "Waiting for gateway to start..."
@@ -137,31 +132,50 @@ jobs:
                   go build -o fast-time-server .
                   chmod +x fast-time-server
 
-            - name: Register Fast Time Gateway and Create Tools
+            - name: Start Fast Time Server as Background Service
               run: |
-                  TOKEN="${{ steps.generate_jwt.outputs.token }}"
-
                   # Kill any existing fast-time-server processes (container reuse cleanup)
                   echo "Cleaning up any existing fast-time-server processes..."
                   pkill -9 -f "fast-time-server" 2>/dev/null || true
                   sleep 1
 
-                  # Start fast-time-server in background (compiled binary)
-                  echo "Starting fast-time-server..."
-                  mcp-servers/go/fast-time-server/fast-time-server \
-                    -transport=dual -listen=0.0.0.0 -port=8889 -log-level=info &
-                  FAST_TIME_PID=$!
+                  # Start fast-time-server as a background service using nohup
+                  echo "Starting fast-time-server as background service..."
+                  nohup mcp-servers/go/fast-time-server/fast-time-server \
+                    -transport=dual -listen=0.0.0.0 -port=8080 -log-level=info \
+                    > fast-time-server.log 2>&1 &
+                  echo $! > fast-time-server.pid
 
                   # Wait for fast-time-server to be ready
                   echo "Waiting for fast-time-server..."
                   for i in {1..30}; do
-                    if curl -s http://localhost:8889/health >/dev/null 2>&1; then
+                    if curl -s http://localhost:8080/health >/dev/null 2>&1; then
                       echo "fast-time-server is up!"
                       break
                     fi
                     echo "Waiting for fast-time-server... (attempt $i)"
                     sleep 2
                   done
+
+                  # Verify server is running
+                  if ! curl -s http://localhost:8080/health >/dev/null 2>&1; then
+                    echo "ERROR: fast-time-server failed to start"
+                    cat fast-time-server.log
+                    exit 1
+                  fi
+                  echo "fast-time-server PID: $(cat fast-time-server.pid)"
+
+            - name: Register Fast Time Gateway and Create Tools
+              run: |
+                  TOKEN="${{ steps.generate_jwt.outputs.token }}"
+
+                  # Verify fast-time-server is still running
+                  if ! curl -s http://localhost:8080/health >/dev/null 2>&1; then
+                    echo "ERROR: fast-time-server is not running"
+                    cat fast-time-server.log
+                    exit 1
+                  fi
+                  echo "fast-time-server is running (PID: $(cat fast-time-server.pid))"
 
                   # Register gateway
                   echo "Registering fast_time gateway..."
@@ -170,7 +184,7 @@ jobs:
                     -H "Content-Type: application/json" \
                     -d '{
                       "name": "fast_time",
-                      "url": "http://localhost:8889/http",
+                      "url": "http://localhost:8080/http",
                       "transport": "STREAMABLEHTTP"
                     }')
                   echo "Gateway response: $GATEWAY_RESPONSE"
@@ -224,29 +238,22 @@ jobs:
                     }")
                   echo "Server response: $SERVER_RESPONSE"
 
-                  # Cleanup - use robust process termination
-                  echo "Cleaning up fast-time-server process..."
-                  if [ -n "$FAST_TIME_PID" ] && kill -0 $FAST_TIME_PID 2>/dev/null; then
-                    echo "Sending SIGTERM to PID $FAST_TIME_PID..."
-                    kill -TERM $FAST_TIME_PID 2>/dev/null || true
-                    # Wait for graceful shutdown (up to 5 seconds)
-                    for i in {1..10}; do
-                      if ! kill -0 $FAST_TIME_PID 2>/dev/null; then
-                        echo "Process $FAST_TIME_PID terminated gracefully"
-                        break
-                      fi
-                      sleep 0.5
-                    done
-                    # Force kill if still running
-                    if kill -0 $FAST_TIME_PID 2>/dev/null; then
-                      echo "Process still running, sending SIGKILL..."
-                      kill -KILL $FAST_TIME_PID 2>/dev/null || true
-                    fi
+                  # Keep server running for wrapper test - no cleanup needed (container is ephemeral)
+
+            - name: Verify Fast Time Server Before Test
+              run: |
+                  echo "Verifying fast-time-server is still running before wrapper test..."
+                  if ! curl -s http://localhost:8080/health >/dev/null 2>&1; then
+                    echo "ERROR: fast-time-server is not running!"
+                    echo "Server log:"
+                    cat fast-time-server.log
+                    echo "PID file content: $(cat fast-time-server.pid 2>/dev/null || echo 'not found')"
+                    ps aux | grep fast-time-server || echo "No fast-time-server process found"
+                    exit 1
                   fi
-                  # Additional cleanup - kill any remaining fast-time-server processes
-                  pkill -9 -f "fast-time-server" 2>/dev/null || true
-                  # Wait for port to be released
-                  sleep 1
+                  echo "✓ fast-time-server is running (PID: $(cat fast-time-server.pid))"
+                  echo "Health check response:"
+                  curl -s http://localhost:8080/health | head -20
 
             - name: Test Wrapper with Fast Time Server
               run: |
@@ -255,6 +262,28 @@ jobs:
                   PORT="4444"
                   URL="http://localhost:${PORT}/servers/${SERVER_ID}/mcp"
                   AUTH="Bearer $TOKEN"
+
+                  # Debug: Verify fast-time-server is accessible
+                  echo "=== Debug: Fast-time-server status ==="
+                  if ! curl -s http://localhost:8080/health >/dev/null 2>&1; then
+                    echo "ERROR: fast-time-server is not accessible!"
+                    exit 1
+                  fi
+                  echo "fast-time-server health:"
+                  curl -s http://localhost:8080/health
+                  echo ""
+
+                  # Debug: Check virtual server configuration
+                  echo "=== Debug: Virtual server configuration ==="
+                  SERVER_INFO=$(curl -s http://localhost:${PORT}/servers/${SERVER_ID} \
+                    -H "Authorization: Bearer $TOKEN")
+                  echo "Server info: $SERVER_INFO" | head -50
+
+                  # Debug: Check tools associated with server
+                  echo "=== Debug: Tools on virtual server ==="
+                  TOOLS_ON_SERVER=$(curl -s "http://localhost:${PORT}/servers/${SERVER_ID}/tools" \
+                    -H "Authorization: Bearer $TOKEN")
+                  echo "Tools on server: $TOOLS_ON_SERVER"
 
                   # Build the Rust wrapper
                   echo "Building Rust wrapper..."
@@ -314,27 +343,30 @@ jobs:
                     exit 1
                   fi
 
+
                   # Verify tool call has a result with time data
-                  if ! echo "$OUTPUT" | grep -q '"method":"tools/call"' || ! echo "$OUTPUT" | grep -A5 '"id":3' | grep -q '"result"'; then
-                    echo "ERROR: Tool call did not return successful result"
+                  # Check if ID 3 has a result and isError is false
+                  IS_SUCCESS=$(echo "$OUTPUT" | jq -r 'select(.id==3) | .result.isError == false')
+                  if [ "$IS_SUCCESS" != "true" ]; then
+                    echo "ERROR: Tool call failed or returned an error state"
                     exit 1
                   fi
                   echo "✓ Tool call returned successful result"
 
                   echo "All wrapper tests passed!"
 
-            # - name: Upload Wrapper Test Artifacts
-            #   if: always()
-            #   uses: actions/upload-artifact@v4
-            #   with:
-            #       name: wrapper-test-logs
-            #       path: |
-            #           wrapper_output.json
-            #           wrapper_test.log
-            #       retention-days: 7
+            - name: Upload Wrapper Test Artifacts
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: wrapper-test-logs
+                  path: |
+                      wrapper_output.json
+                      wrapper_test.log
+                  retention-days: 7
 
             - name: Keep server running for debug
-              if: always()
+              if: false
               run: |
                   echo "Keeping server running for debugging..."
                   sleep 3000
