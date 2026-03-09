@@ -50,6 +50,17 @@ jobs:
 
             - name: Install uv
               uses: astral-sh/setup-uv@v5
+              with:
+                  enable-cache: true
+
+            - name: Cache uv virtual environment
+              uses: actions/cache@v4
+              with:
+                  path: .venv
+                  key: venv-${{ runner.os }}-${{ hashFiles('uv.lock') }}-${{ steps.check-python.outputs.version }}
+                  restore-keys: |
+                      venv-${{ runner.os }}-${{ hashFiles('uv.lock') }}-
+                      venv-${{ runner.os }}-
 
             - name: Setup Rust
               if: true
@@ -60,6 +71,7 @@ jobs:
               uses: swatinem/rust-cache@v2
               with:
                   workspaces: tools_rust/wrapper
+                  cache-on-failure: true
 
             - name: Compile
               if: true
@@ -118,6 +130,7 @@ jobs:
               with:
                   go-version: "1.21"
                   cache-dependency-path: mcp-servers/go/fast-time-server/go.sum
+                  cache: true
 
             - name: Build fast-time-server
               working-directory: mcp-servers/go/fast-time-server
