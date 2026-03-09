@@ -1,117 +1,128 @@
 name: Wrapper CI/CD
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened]
-  workflow_dispatch:
+    push:
+        branches: [main]
+    pull_request:
+        branches: [main]
+        types: [opened, synchronize, reopened]
+    workflow_dispatch:
 
 env:
-  CARGO_TERM_COLOR: never
-  RUST_BACKTRACE: 1
+    CARGO_TERM_COLOR: never
+    RUST_BACKTRACE: 1
 
 jobs:
-  rust-checks:
-    name: Rust Checks
-    runs-on: ubuntu-latest
-    steps:
-      - name: Display Hardware Information
-        run: |
-          echo "## Env Information" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### CPU Info" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          lscpu | grep -E "^(Model name|CPU\(s\)|Thread|Core)" >> $GITHUB_STEP_SUMMARY
-          python -V >> $GITHUB_STEP_SUMMARY
-          pwd >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+    rust-checks:
+        name: Rust Checks
+        runs-on: ubuntu-latest
+        steps:
+            - name: Display Hardware Information
+              run: |
+                  echo "## Env Information" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "### CPU Info" >> $GITHUB_STEP_SUMMARY
+                  echo '```' >> $GITHUB_STEP_SUMMARY
+                  lscpu | grep -E "^(Model name|CPU\(s\)|Thread|Core)" >> $GITHUB_STEP_SUMMARY
+                  python -V >> $GITHUB_STEP_SUMMARY
+                  pwd >> $GITHUB_STEP_SUMMARY
+                  echo '```' >> $GITHUB_STEP_SUMMARY
 
-      - uses: actions/checkout@v4
+            - uses: actions/checkout@v4
 
-      - name: Check Python Version
-        id: check-python
-        run: |
-          # Get major.minor version from the default python3
-          if command -v python3 &>/dev/null; then
-            ver=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-            echo "version=$ver" >> $GITHUB_OUTPUT
-          else
-            echo "version=none" >> $GITHUB_OUTPUT
-          fi
+            - name: Check Python Version
+              id: check-python
+              run: |
+                  # Get major.minor version from the default python3
+                  if command -v python3 &>/dev/null; then
+                    ver=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+                    echo "version=$ver" >> $GITHUB_OUTPUT
+                  else
+                    echo "version=none" >> $GITHUB_OUTPUT
+                  fi
 
-      - name: Setup Python
-        # Only run this if the current system python is NOT 3.12
-        if: ${{ steps.check-python.outputs.version != '3.12' }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+            - name: Setup Python
+              # Only run this if the current system python is NOT 3.12
+              if: ${{ steps.check-python.outputs.version != '3.12' }}
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.12"
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
+            - name: Install uv
+              uses: astral-sh/setup-uv@v5
 
-      - name: Setup Rust
-        if: false
-        uses: dtolnay/rust-toolchain@stable
+            - name: Setup Rust
+              if: false
+              uses: dtolnay/rust-toolchain@stable
 
-      - name: Rust Cache
-        if: false
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: tools_rust/wrapper        
+            - name: Rust Cache
+              if: false
+              uses: swatinem/rust-cache@v2
+              with:
+                  workspaces: tools_rust/wrapper
 
-      - name: Compile
-        if: false
-        working-directory: tools_rust/wrapper
-        run: cargo build --release
+            - name: Compile
+              if: false
+              working-directory: tools_rust/wrapper
+              run: cargo build --release
 
-      - name: Where am I?
-        if: false
-        run: |
-          tools_rust/wrapper/target/release/mcp_stdio_wrapper --help
+            - name: Where am I?
+              if: false
+              run: |
+                  tools_rust/wrapper/target/release/mcp_stdio_wrapper --help
 
-      - name: Setup Secrets
-        run: |
-          # Generate secrets dynamically
-          echo "DYNAMIC_JWT_SECRET=$(openssl rand -base64 32)" >> $GITHUB_ENV
+            - name: Secrets
+              run: |
+                  # Check if a local .persistent_secret file exists (mounted from host)
+                  if [ -f "./.persistent_secret" ]; then
+                    echo "DYNAMIC_JWT_SECRET=$(cat .persistent_secret)" >> $GITHUB_ENV
+                  else
+                    SECRET=$(openssl rand -base64 32)
+                    echo "DYNAMIC_JWT_SECRET=$SECRET" >> $GITHUB_ENV
+                    echo "$SECRET" > .persistent_secret
+                  fi
 
+            - name: Run gateway
+              env:
+                  GUNICORN_WORKERS: 1
+                  MCPGATEWAY_UI_ENABLED: true
+                  MCPGATEWAY_ADMIN_API_ENABLED: true
+                  JWT_SECRET_KEY: ${{ env.DYNAMIC_JWT_SECRET }}
 
-      - name: Run gateway
-        env:
-          GUNICORN_WORKERS: 1
-          MCPGATEWAY_UI_ENABLED: true
-          MCPGATEWAY_ADMIN_API_ENABLED: true
-          JWT_SECRET_KEY: ${{ env.DYNAMIC_JWT_SECRET }}
-          
-        run: |
+              run: |
 
-          make venv
-          make install
-          make serve &
+                  make venv
+                  make install
+                  make serve &
 
-          echo "Waiting for gateway to start..."
-          for i in {1..60}; do
-            if curl -s http://localhost:4444 >/dev/null 2>&1; then
-              echo "Gateway is up!"
-              break
-            fi
-            echo "Waiting for port 4444 to open... (attempt $i)"
-            sleep 1
-          done
+                  echo "Waiting for gateway to start..."
+                  for i in {1..60}; do
+                    if curl -s http://localhost:4444 >/dev/null 2>&1; then
+                      echo "Gateway is up!"
+                      break
+                    fi
+                    echo "Waiting for port 4444 to open... (attempt $i)"
+                    sleep 1
+                  done
 
-      - name: Generate JWT Token
-        id: generate_jwt
-        env:
-          JWT_SECRET_KEY: ${{ env.DYNAMIC_JWT_SECRET }}
-        run: |
-          TOKEN=$(uv run --no-dev python -m mcpgateway.utils.create_jwt_token --username admin@example.com --exp 10080 --secret "$JWT_SECRET_KEY")
-          echo "token=$TOKEN" >> $GITHUB_OUTPUT
-          echo "JWT Token generated successfully"
+            - name: Generate JWT Token
+              id: generate_jwt
+              env:
+                  JWT_SECRET_KEY: ${{ env.DYNAMIC_JWT_SECRET }}
+              run: |
+                  TOKEN=$(uv run --no-dev python -m mcpgateway.utils.create_jwt_token --username admin@example.com --exp 10080 --secret "$JWT_SECRET_KEY")
+                  echo "token=$TOKEN" >> $GITHUB_OUTPUT
+                  echo "JWT Token generated successfully"
 
-      - name: Keep server running for debug
-        if: always()
-        run: |
-          echo "Keeping server running for 5 minutes for debugging..."
-          sleep 300
-          echo "Debug period ended"
+            - name: Fetch Version Info
+              run: |
+                  curl -v -X GET http://localhost:4444/version \
+                  -H "Authorization: Bearer ${{ steps.generate_jwt.outputs.token }}" \
+                  -H "Content-Type: application/json"
+
+            - name: Keep server running for debug
+              if: always()
+              run: |
+                  echo "Keeping server running for 5 minutes for debugging..."
+                  sleep 300
+                  echo "Debug period ended"
