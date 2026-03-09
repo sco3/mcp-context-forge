@@ -356,7 +356,7 @@ jobs:
                   echo "All wrapper tests passed!"
 
             - name: Upload Wrapper Test Artifacts
-              if: always()
+              if: failure()
               uses: actions/upload-artifact@v4
               with:
                   name: wrapper-test-logs
@@ -365,7 +365,7 @@ jobs:
                       wrapper_test.log
                   retention-days: 7
 
-            - name: Keep server running for debug
+            - name: Keep server running for debug - set true
               if: false
               run: |
                   echo "Keeping server running for debugging..."
