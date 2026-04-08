@@ -217,11 +217,8 @@ services:
       - SSRF_ALLOW_LOCALHOST=${SSRF_ALLOW_LOCALHOST:-true}
       - SSRF_ALLOW_PRIVATE_NETWORKS=${SSRF_ALLOW_PRIVATE_NETWORKS:-true}
       - SSRF_DNS_FAIL_CLOSED=${SSRF_DNS_FAIL_CLOSED:-false}
-      # Database connection: Via PgBouncer (default) or direct PostgreSQL
-      # PgBouncer provides connection pooling for better performance under high concurrency
-      - DATABASE_URL=${DATABASE_URL:-postgresql+psycopg://postgres:${POSTGRES_PASSWORD:-mysecretpassword}@pgbouncer:6432/mcp}
-      # Direct PostgreSQL connection (bypass PgBouncer - increase DB_POOL_SIZE if using):
-      # - DATABASE_URL=postgresql+psycopg://postgres:${POSTGRES_PASSWORD:-mysecretpassword}@postgres:5432/mcp
+      # Database connection: Direct YugabyteDB (PostgreSQL-compatible) connection
+      - DATABASE_URL=${DATABASE_URL:-postgresql+psycopg://postgres:${POSTGRES_PASSWORD:-mysecretpassword}@yugabytedb:5433/yugabyte}
       # SQLAlchemy query logging (useful for N+1 detection; noisy under load)
       # NOTE: SQLALCHEMY_ECHO logs at INFO; set LOG_LEVEL=INFO/DEBUG to see output.
       - SQLALCHEMY_ECHO=false
@@ -456,20 +453,18 @@ services:
       # Database Connection Pool Configuration
       # ═══════════════════════════════════════════════════════════════════════════
       # Pool class options:
-      #   - "null": NullPool - no application pooling, PgBouncer handles all pooling (recommended)
-      #   - "queue": QueuePool - application-side pooling (use with direct PostgreSQL)
-      #   - "auto": Automatic - NullPool if PgBouncer detected in URL, else QueuePool
+      #   - "null": NullPool - no application pooling (simplest, each request gets new connection)
+      #   - "queue": QueuePool - application-side pooling (recommended for direct YugabyteDB)
+      #   - "auto": Automatic - detects connection string and chooses appropriately
       #
-      # WITH PgBouncer (default in docker-compose):
-      # Option A: NullPool - safest, eliminates stale connection errors, ~10% slower
-      # - DB_POOL_CLASS=null
-      # Option B: QueuePool + pre_ping - better performance, validates before use
+      # Direct YugabyteDB connection (default in docker-compose):
+      # QueuePool + pre_ping - best performance with connection validation
       - DB_POOL_CLASS=queue
       - DB_POOL_PRE_PING=true          # Validate connections before use (SELECT 1)
       - DB_POOL_SIZE=20                # Pool size per worker
       - DB_MAX_OVERFLOW=10             # Extra connections under load
       - DB_POOL_TIMEOUT=60             # Time to wait for connection before failing
-      - DB_POOL_RECYCLE=60             # Recycle before PgBouncer CLIENT_IDLE_TIMEOUT (half of 120s)
+      - DB_POOL_RECYCLE=300            # Recycle connections every 5 minutes (prevents stale connections)
       # ═══════════════════════════════════════════════════════════════════════════
       # Database Startup Resilience (prevents crash-loop on DB outage)
       # ═══════════════════════════════════════════════════════════════════════════
@@ -676,16 +671,11 @@ services:
         soft: 65535
         hard: 65535
 
-    depends_on:          # Default stack: PgBouncer + Redis (PgBouncer depends on Postgres)
-      pgbouncer:
-        condition: service_healthy   # ▶ wait for connection pooler
+    depends_on:          # Default stack: YugabyteDB + Redis
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_started
-      # Direct PostgreSQL (uncomment if bypassing PgBouncer):
-      # postgres:
-      #   condition: service_healthy
-      # migration:
-      #   condition: service_completed_successfully
 
     healthcheck:
       ## Uncomment for HTTP healthcheck
@@ -793,122 +783,37 @@ services:
 ###############################################################################
 
   postgres:
-    image: postgres:18
-    shm_size: 256m  # Increase from 64MB default to prevent shared memory exhaustion under load
+    image: yugabytedb/yugabyte:latest
+    hostname: yugabytedb
+    shm_size: 256m
     ulimits:
       nofile:
         soft: 8192
         hard: 8192
     ports:
-      - "5433:5432"      # Expose for baseline load testing (5433 to avoid conflict with local postgres)
-    # Performance tuning for high-load testing (3000 sustained users)
-    # WITH PgBouncer (default): 800 connections provides headroom for 700 pool + system overhead
-    # DIRECT connection mode: increase to 4000 for (3 replicas × 16 workers × 80 pool)
+      - "5433:5433"
+      - "15433:15433"
+      - "9042:9042"
+      - "7000:7000"
+      - "9000:9000"
     command:
-      - "postgres"
-      - "-c"
-      - "max_connections=800"     # Must exceed PgBouncer MAX_DB_CONNECTIONS (700) + overhead
-      - "-c"
-      - "shared_buffers=512MB"
-      - "-c"
-      - "work_mem=16MB"
-      - "-c"
-      - "effective_cache_size=1536MB"
-      - "-c"
-      - "maintenance_work_mem=128MB"
-      - "-c"
-      - "checkpoint_completion_target=0.9"
-      - "-c"
-      - "wal_buffers=16MB"
-      - "-c"
-      - "random_page_cost=1.1"
-      - "-c"
-      - "effective_io_concurrency=200"
-      - "-c"
-      - "max_worker_processes=8"           # Total background workers (must be >= max_parallel_workers)
-      - "-c"
-      - "max_parallel_workers_per_gather=4" # Max workers per query's parallel operation
-      - "-c"
-      - "max_parallel_workers=8"            # Total parallel workers available system-wide
-      # === HIGH-CONCURRENCY TUNING (3000 users) ===
-      # CRITICAL: idle_in_transaction_session_timeout prevents connection starvation
-      # Application code now properly closes transactions via get_db() commit-on-success pattern
-      # This timeout is a safety net for any edge cases
-      - "-c"
-      - "idle_in_transaction_session_timeout=300s"  # Kill stuck transactions after 300s (aligned with PgBouncer)
-      - "-c"
-      - "statement_timeout=120s"           # Kill runaway queries after 120s
-      - "-c"
-      - "synchronous_commit=off"           # Async WAL writes (2-10x faster commits)
-      - "-c"
-      - "commit_delay=100"                 # Batch commits within 100μs window
-      # ═══════════════════════════════════════════════════════════════════════════
-      # AUTOVACUUM TUNING - High-insert workloads (metrics tables)
-      # ═══════════════════════════════════════════════════════════════════════════
-      # High insert rates cause dead tuple accumulation. These settings help
-      # PostgreSQL keep up with table bloat from metrics writes.
-      # Uncomment if experiencing performance degradation under sustained load:
-      # - "-c"
-      # - "autovacuum_naptime=30s"              # Check more frequently (default: 60s)
-      # - "-c"
-      # - "autovacuum_vacuum_scale_factor=0.05" # Vacuum at 5% dead tuples (default: 0.2)
-      # - "-c"
-      # - "autovacuum_vacuum_cost_limit=1000"   # More vacuum work per cycle (default: 200)
-      # === PG_STAT_STATEMENTS + AUTO_EXPLAIN ===
-      # Query performance tracking and slow query plan logging
-      # NOTE: Both extensions must be in the SAME shared_preload_libraries line!
-      # After enabling, run in psql:
-      #   CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
-      #   SELECT * FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 10;
-      # - "-c"
-      # - "shared_preload_libraries=pg_stat_statements"
-      # - "shared_preload_libraries=pg_stat_statements,auto_explain"  # Use this line to enable both
-      # - "-c"
-      # - "pg_stat_statements.track=all"
-      # - "-c"
-      #- "pg_stat_statements.max=10000"
-      # AUTO_EXPLAIN settings (uncomment if using combined shared_preload_libraries above)
-      # - "-c"
-      # - "auto_explain.log_min_duration=1000"
-      # - "-c"
-      # - "auto_explain.log_analyze=on"
-      # === ROLLBACK DEBUGGING (disabled for performance) ===
-      # - "-c"
-      # - "log_min_error_statement=error"
-      # - "-c"
-      # - "log_min_messages=warning"
-      # - "-c"
-      # - "log_error_verbosity=verbose"
-      # - "-c"
-      # - "log_line_prefix=%t [%p]: user=%u,db=%d,app=%a,client=%h "
-      # - "-c"
-      # - "log_lock_waits=on"
-      # - "-c"
-      # - "deadlock_timeout=1s"
-      # - "-c"
-      # - "log_temp_files=0"
-      # - "-c"
-      # - "log_checkpoints=on"
-      # - "-c"
-      # - "log_connections=on"
-      # - "-c"
-      # - "log_disconnections=on"
-      # - "-c"
-      # - "idle_in_transaction_session_timeout=60s"
-    environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=mysecretpassword
-      - POSTGRES_DB=mcp
+      - "/home/yugabyte/bin/yugabyted"
+      - "start"
+      - "--base_dir=/tmp/yugabyte"
+      - "--daemon=false"
+      - "--advertise_address=yugabytedb"
     volumes:
-      # - pgdata:/var/lib/postgresql/data
-      - pgdata:/var/lib/postgresql  # Enable for postgres 18+
-    networks: [mcpnet]
+      - pgdata:/tmp/yugabyte
+    networks:
+      mcpnet:
+        aliases:
+          - yugabytedb
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"]
-      interval: 30s
+      test: ["CMD", "curl", "-f", "http://yugabytedb:7000"]
+      interval: 10s
       timeout: 5s
-      retries: 5
-      start_period: 20s
+      retries: 15
+      start_period: 90s
     deploy:
       resources:
         limits:
@@ -918,75 +823,6 @@ services:
           cpus: '2'
           memory: 2G
 
-  # ──────────────────────────────────────────────────────────────────────
-  # PgBouncer - Connection Pooler for PostgreSQL
-  # Reduces connection overhead, improves throughput under high concurrency.
-  # Enable by switching gateway DATABASE_URL to use pgbouncer:6432 instead of postgres:5432
-  # ──────────────────────────────────────────────────────────────────────
-  pgbouncer:
-    image: edoburu/pgbouncer:latest
-    restart: unless-stopped
-    networks: [mcpnet]
-    ulimits:
-      nofile:
-        soft: 65536
-        hard: 65536
-    ports:
-      - "6432:6432"    # PgBouncer port (optional external access)
-    environment:
-      # Connection to upstream PostgreSQL
-      - DATABASE_URL=postgres://postgres:${POSTGRES_PASSWORD:-mysecretpassword}@postgres:5432/mcp
-      # PgBouncer listen port (default would be 5432, using 6432 to distinguish from PostgreSQL)
-      - LISTEN_PORT=6432
-      # Pool mode: transaction (recommended), session, or statement
-      # transaction: connection returned after each transaction (best for web apps)
-      - POOL_MODE=transaction
-      # ═══════════════════════════════════════════════════════════════════════════
-      # Connection Pool Tuning for 3000 Sustained Users
-      # PgBouncer handles connection multiplexing - many app connections share fewer DB connections
-      # ═══════════════════════════════════════════════════════════════════════════
-      # Client-side limits (from gateway workers via SQLAlchemy)
-      - MAX_CLIENT_CONN=5000           # Max app connections; must exceed (replicas × workers × pool)
-      - DEFAULT_POOL_SIZE=600          # Shared DB connections; sized for ~70 concurrent tx × 8x headroom
-      - MIN_POOL_SIZE=100              # Pre-warmed connections for instant response to load spikes
-      - RESERVE_POOL_SIZE=150          # Emergency pool for burst traffic beyond DEFAULT_POOL_SIZE
-      - RESERVE_POOL_TIMEOUT=2         # Seconds before tapping reserve pool
-      # Server-side limits (to PostgreSQL)
-      - MAX_DB_CONNECTIONS=700         # Max connections to PostgreSQL; must be < PG max_connections
-      - MAX_USER_CONNECTIONS=700       # Per-user limit; typically equals MAX_DB_CONNECTIONS
-      # Connection lifecycle
-      - SERVER_LIFETIME=3600           # Recycle server connections after 1 hour (prevents stale state)
-      - SERVER_IDLE_TIMEOUT=600        # Close unused server connections after 10 min
-      # Timeout settings
-      - QUERY_WAIT_TIMEOUT=60          # Max wait for available connection before failing request
-      - CLIENT_IDLE_TIMEOUT=120        # Close idle client connections (4x IDLE_TRANSACTION_TIMEOUT; DB_POOL_RECYCLE=60 is half this, ensuring proactive recycle before PgBouncer closes them)
-      - SERVER_CONNECT_TIMEOUT=5       # Timeout for new connections to PostgreSQL
-      # Transaction cleanup - critical for avoiding idle-in-transaction buildup
-      # NOTE: In transaction pooling, session-level advisory locks (used by migrations)
-      # can stick unless the reset query clears them; DISCARD ALL is safest.
-      - SERVER_RESET_QUERY=DISCARD ALL # Reset connection state when returned to pool
-      - SERVER_RESET_QUERY_ALWAYS=1    # Always run reset query even after clean transactions
-      - IDLE_TRANSACTION_TIMEOUT=30    # Kill transactions idle > 30s to prevent connection pool exhaustion
-      # Authentication
-      - AUTH_TYPE=scram-sha-256        # Match PostgreSQL auth method
-    depends_on:
-      postgres:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "pg_isready", "-h", "localhost", "-p", "6432"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-    deploy:
-      resources:
-        limits:
-          cpus: '1'
-          memory: 256M
-        reservations:
-          cpus: '0.5'
-          memory: 128M
-
   # migration:
   #   #image: ghcr.io/ibm/mcp-context-forge:0.7.0 # Testing migration from 0.7.0
   #   image: mcpgateway/mcpgateway:latest # Use the local latest image. Run `make docker-prod` to build it.
@@ -994,7 +830,7 @@ services:
   #     context: .
   #     dockerfile: Containerfile
   #   environment:
-  #     - DATABASE_URL=postgresql+psycopg://postgres:${POSTGRES_PASSWORD:-mysecretpassword}@postgres:5432/mcp
+  #     - DATABASE_URL=postgresql+psycopg://postgres:${POSTGRES_PASSWORD:-mysecretpassword}@yugabytedb:5433/yugabyte
   #   command: alembic -c mcpgateway/alembic.ini upgrade head
   #   depends_on:
   #     postgres:
@@ -1055,7 +891,7 @@ services:
     ports:
       - "${POSTGRES_EXPORTER_PORT:-9187}:9187"    # http://localhost:${POSTGRES_EXPORTER_PORT:-9187}/metrics
     environment:
-      - DATA_SOURCE_NAME=postgresql://postgres:${POSTGRES_PASSWORD:-mysecretpassword}@postgres:5432/mcp?sslmode=disable
+      - DATA_SOURCE_NAME=postgresql://postgres:${POSTGRES_PASSWORD:-mysecretpassword}@yugabytedb:5433/yugabyte?sslmode=disable
       - PG_EXPORTER_AUTO_DISCOVER_DATABASES=true
     depends_on:
       postgres:
@@ -1077,23 +913,6 @@ services:
     depends_on:
       redis:
         condition: service_started
-    profiles: ["monitoring"]
-
-  # ──────────────────────────────────────────────────────────────────────
-  # Prometheus PgBouncer Exporter - Connection pool metrics
-  # Metrics: active/waiting clients, server connections, pool stats
-  # ──────────────────────────────────────────────────────────────────────
-  pgbouncer_exporter:
-    image: prometheuscommunity/pgbouncer-exporter:latest
-    restart: unless-stopped
-    networks: [mcpnet]
-    ports:
-      - "${PGBOUNCER_EXPORTER_PORT:-9127}:9127"    # http://localhost:${PGBOUNCER_EXPORTER_PORT:-9127}/metrics
-    environment:
-      - PGBOUNCER_EXPORTER_CONNECTION_STRING=postgres://postgres:${POSTGRES_PASSWORD:-mysecretpassword}@pgbouncer:6432/pgbouncer?sslmode=disable
-    depends_on:
-      pgbouncer:
-        condition: service_healthy
     profiles: ["monitoring"]
 
   # ──────────────────────────────────────────────────────────────────────
@@ -1555,6 +1374,8 @@ services:
             except Exception as e:
                 print(f'❌ Registration failed: {e}')
                 sys.exit(1)
+        else:
+            print(f'Reusing existing gateway {gateway_id}, will force refresh...')
 
         # Force immediate discovery before polling for synced catalog entries.
         try:
@@ -1567,7 +1388,8 @@ services:
             )
             print(f'Refresh response: {refresh_result}')
         except Exception as e:
-            print(f'Note: manual refresh did not complete immediately: {e}')
+            print(f'❌ Refresh failed: {e}')
+            sys.exit(1)
 
         # Wait for tools to be synced from the gateway
         print('Waiting for tools/resources/prompts to sync...')
