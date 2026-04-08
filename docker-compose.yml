@@ -47,7 +47,9 @@ networks:
     driver: bridge
 
 volumes:                # Named volumes survive podman-compose down/up
-  pgdata:
+  pgdata1:
+  pgdata2:
+  pgdata3:
   # pgdata18:  # Enable for postgres 18+
   pgadmindata:
   redisinsight_data:
@@ -782,9 +784,12 @@ services:
 #  DATABASES - enable ONE of these blocks and adjust DATABASE_URL
 ###############################################################################
 
+###############################################################################
+#  DATABASE — YugabyteDB 3-node cluster (PostgreSQL-compatible)
+###############################################################################
   postgres:
     image: yugabytedb/yugabyte:latest
-    hostname: yugabytedb
+    container_name: yugabytedb-1
     shm_size: 256m
     ulimits:
       nofile:
@@ -792,24 +797,22 @@ services:
         hard: 8192
     ports:
       - "5433:5433"
-      - "15433:15433"
-      - "9042:9042"
       - "7000:7000"
       - "9000:9000"
     command:
-      - "/home/yugabyte/bin/yugabyted"
+      - "bin/yugabyted"
       - "start"
-      - "--base_dir=/tmp/yugabyte"
+      - "--listen=yugabytedb-1"
       - "--daemon=false"
-      - "--advertise_address=yugabytedb"
     volumes:
-      - pgdata:/tmp/yugabyte
+      - pgdata1:/tmp/yugabyte
     networks:
       mcpnet:
         aliases:
           - yugabytedb
+          - yugabytedb-1
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://yugabytedb:7000"]
+      test: ["CMD", "curl", "-f", "http://yugabytedb-1:7000"]
       interval: 10s
       timeout: 5s
       retries: 15
@@ -823,6 +826,93 @@ services:
           cpus: '2'
           memory: 2G
 
+  postgres-2:
+    image: yugabytedb/yugabyte:latest
+    container_name: yugabytedb-2
+    shm_size: 256m
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192
+    ports:
+      - "5434:5433"
+      - "7001:7000"
+      - "9001:9000"
+    command:
+      - "bin/yugabyted"
+      - "start"
+      - "--listen=yugabytedb-2"
+      - "--join=yugabytedb-1"
+      - "--daemon=false"
+    volumes:
+      - pgdata2:/tmp/yugabyte
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      mcpnet:
+        aliases:
+          - yugabytedb-2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://yugabytedb-2:7000"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 2G
+
+  postgres-3:
+    image: yugabytedb/yugabyte:latest
+    container_name: yugabytedb-3
+    shm_size: 256m
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192
+    ports:
+      - "5435:5433"
+      - "7002:7000"
+      - "9002:9000"
+    command:
+      - "bin/yugabyted"
+      - "start"
+      - "--listen=yugabytedb-3"
+      - "--join=yugabytedb-1"
+      - "--daemon=false"
+    volumes:
+      - pgdata3:/tmp/yugabyte
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      mcpnet:
+        aliases:
+          - yugabytedb-3
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://yugabytedb-3:7000"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 2G
+
+###############################################################################
+#  DATABASE - commented-out migration helper
+###############################################################################
   # migration:
   #   #image: ghcr.io/ibm/mcp-context-forge:0.7.0 # Testing migration from 0.7.0
   #   image: mcpgateway/mcpgateway:latest # Use the local latest image. Run `make docker-prod` to build it.
@@ -1384,7 +1474,7 @@ services:
                 f'/gateways/{gateway_id}/tools/refresh?include_resources=true&include_prompts=true',
                 retries=20,
                 delay=2,
-                retry_statuses=(401, 409, 502, 503),
+                retry_statuses=(401, 404, 409, 502, 503),
             )
             print(f'Refresh response: {refresh_result}')
         except Exception as e:
