@@ -239,15 +239,16 @@ jobs:
               }
             }")
           echo "Server response: $SERVER_RESPONSE"
+
       - name: Test sql-sanitizer (npx tsx)
         env:
           TOKEN: ${{ steps.generate_jwt.outputs.token }}
         run: |
-          npx tsx tests/sql-injection-attack-test.ts
+          npx -p @modelcontextprotocol/sdk -p tsx tsx tests/sql-injection-attack-test.ts
 
       - name: Upload logs on failure
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: sql-sanitizer-test-logs
           path: |
