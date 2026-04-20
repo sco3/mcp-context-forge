@@ -259,14 +259,16 @@ jobs:
                     }")
                   echo "Server response: $SERVER_RESPONSE"
 
-            - name: Manual Node 22 Install
+            - name: Local Node 22 Install
               run: |
+                mkdir -p $GITHUB_WORKSPACE/node22
                 curl -fsSL https://nodejs.org/dist/v22.22.0/node-v22.22.0-linux-x64.tar.xz -o node22.tar.xz
-                sudo tar -xJf node22.tar.xz --strip-components=1 -C /usr/local
-                node -v
+                tar -xJf node22.tar.xz --strip-components=1 -C $GITHUB_WORKSPACE/node22
+                $GITHUB_WORKSPACE/node22/bin/node -v            
 
             - name: Test sql-sanitizer
               run: |
+                  export PATH="$GITHUB_WORKSPACE/node22/bin:$PATH"
                   TOKEN="${{ steps.generate_jwt.outputs.token }}"
                   SERVER_ID=$(echo "9779b669-8cbd-4b49-95ee-04a4fab38737" | tr -d '-')
                   URL="http://localhost:4444/servers/${SERVER_ID}/mcp"
